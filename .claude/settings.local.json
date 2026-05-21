@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync:*)",
+      "Bash(.venv/Scripts/python --version)",
+      "Bash(.venv/Scripts/uv pip:*)",
+      "Bash(uv pip:*)",
+      "Bash(nvidia-smi)",
+      "Bash(wsl:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(cd:*)",
+      "Bash(.venv/Scripts/python -c \"import jax; print\\(''jax'', jax.__version__\\); import flax; print\\(''flax'', flax.__version__\\)\")"
+    ]
+  }
+}
