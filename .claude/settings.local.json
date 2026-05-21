@@ -9,7 +9,11 @@
       "Bash(wsl:*)",
       "Bash(sudo apt-get:*)",
       "Bash(cd:*)",
-      "Bash(.venv/Scripts/python -c \"import jax; print\\(''jax'', jax.__version__\\); import flax; print\\(''flax'', flax.__version__\\)\")"
+      "Bash(.venv/Scripts/python -c \"import jax; print\\(''jax'', jax.__version__\\); import flax; print\\(''flax'', flax.__version__\\)\")",
+      "WebFetch(domain:www.pi.website)",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
