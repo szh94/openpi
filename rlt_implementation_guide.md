@@ -628,9 +628,203 @@ PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
   3. 更新 Actor: min -Q + β·BC_reg
 ```
 
+#### 内循环详解
+
+##### 前置：为什么内循环要跑 G 次更新？
+
+这是 **off-policy** 算法的核心优势：数据收集（rollout）和学习（training）的频率可以解耦。
+
+```
+┌─ Rollout 进程（慢）────────────────┐
+│ 机器人每走 10 步 → 存 1 条 transition │  ← 受物理世界速度限制
+└────────────────────────────────────┘
+                    ↓
+┌─ Learner 进程（快）─────────────────┐
+│ 每收集到 1 条 transition → 复用 G 次  │  ← G 通常 ≈ 10-50
+│ 从 buffer 反复采样旧数据学习           │     一条数据用多次
+└────────────────────────────────────┘
+```
+
+物理世界 1 秒只能走 ~10 步，但 GPU 1 秒能学 ~100 次。不让 Learner 闲着，提高样本效率。
+
 ---
 
-## 6. 与 pi0.6 (RECAP) 的区别
+##### Step 1：从 Replay Buffer 采样 batch
+
+```
+从 Buffer B 中均匀随机采样 N 条 transition（N 通常 256-1024）:
+
+  sampled_batch = {
+      state:       [N, 2080]    ← RL Token + proprio
+      action:      [N, 320]     ← 当时 Actor 执行的动作 a₁:C
+      reward:      [N, 1]       ← 执行后得到的标量奖励
+      next_state:  [N, 2080]    ← 执行 C 步后的状态
+      done:        [N, 1]       ← 是否终止
+  }
+```
+
+**为什么要随机采样，而不是用最新数据？**
+
+- **打破时间相关性**：连续采集的 transition 高度相关（前一步和后一步状态几乎一样），直接顺序学习会让网络"记住"局部模式而非真正理解任务。随机混洗解决了这个问题。
+- **提高数据利用率**：旧数据仍然有价值，随机采样让每条数据能被复用多次。
+
+---
+
+##### Step 2：TD3 更新 Critic
+
+Critic 的损失函数：
+
+```
+L_Q(ψ) = E[(ˆQ - Q_ψ(x, a₁:C))²]
+```
+
+这是一个 **TD（Temporal Difference）回归问题**：
+
+- **预测值 Q_ψ(x, a)**：Critic 网络当前对"在状态 x 做动作 a 的未来累积奖励"的估计
+- **目标值 ˆQ**: 用实际观察到的 reward + 对下一状态的估计来构造，公式：
+
+```
+ˆQ = r + γ · (1-done) · min(Q_ψ₁'(x', a'), Q_ψ₂'(x', a'))
+   ↑                 ↑
+   实际奖励          TD3 双 Critic 取最小值（防高估）
+```
+
+##### TD3 的三项关键技术
+
+| 技术 | 做法 | 解决什么问题 |
+|---|---|---|
+| **Twin Critics（双 Critic）** | 独立训练两个 Critic 网络 Q₁, Q₂，计算目标时取 **min(Q₁, Q₂)** | 标准 DQN 会系统性高估 Q 值 → 策略学偏。双网络取最小值提供更保守的估计 |
+| **Target Networks（目标网络）** | 用延迟更新的 ψ' 计算目标 ˆQ，而非用当前 ψ。每 K 步用 Polyak 平均软同步：`ψ' ← τ·ψ + (1-τ)·ψ'`，τ=0.005 | 防止"移动目标"问题——如果目标和预测用同一网络同步更新，会形成正反馈振荡 |
+| **Target Policy Smoothing（目标平滑）** | 计算目标 Q 时，在下一个动作 a' 上加小噪声：`a' = π_θ'(x') + clip(ε, -c, c)`，ε ~ N(0, σ) | 防止 Critic 在动作空间的尖峰上过拟合，让它学会更平滑的 Q 面 |
+
+**数据流图**：
+
+```
+sampled_batch
+  ├→ (x, a, r, x', done)
+
+  # ── 计算目标 Q 值（用目标网络，不计算梯度）──
+  a' = target_actor(x')                        # 目标 Actor 给出下一动作
+  a' = a' + clip(ε, -c, c)                     # 目标平滑（添加噪声）
+  Q1_target = target_critic_1(x', a')           # 目标 Critic 1
+  Q2_target = target_critic_2(x', a')           # 目标 Critic 2
+  Q_target = r + γ · (1-done) · min(Q1_target, Q2_target)  # TD target（取最小值）
+
+  # ── 更新在线 Critic（计算梯度，反向传播）──
+  Q1_current = critic_1(x, a)                   # 当前 Critic 1 的预测
+  Q2_current = critic_2(x, a)                   # 当前 Critic 2 的预测
+  L_Q = MSE(Q1_current, Q_target) + MSE(Q2_current, Q_target)  # 两个 Critic 的损失之和
+  ψ ← ψ - α · ∇L_Q                              # 梯度下降更新
+```
+
+##### Step 3：更新 Actor
+
+Actor 的损失函数：
+
+```
+L_π(θ) = E[-Q_ψ(x, a₁:C) + β · ‖a₁:C - \tilde{a}₁:C‖²]
+```
+
+两种力的博弈：
+
+| 项 | 含义 | 效果 |
+|---|---|---|
+| **-Q(s, a)** | Critic 认为的动作价值，加负号 → 最大化 Q | 推动 Actor 选择"Critic 认为好"的动作 |
+| **β · ‖a - \tilde{a}‖²** | 与 VLA 参考动作的 MSE，即 BC 正则化 | 拉住 Actor，不让它偏离 VLA 太远 |
+
+**为什么需要 BC 正则化？**
+
+```
+Q 面不是完美准确的 ──── 特别是在 out-of-distribution 区域
+                        │
+  Actor 如果只追求 Q 最大化 ──→ 会找到 Q 面的"假高峰"（adversarial exploitation）
+                        │
+  加上 BC 正则 ──→ 把 Actor 约束在 VLA 附近 ← VLA 见过的分布内
+                        │
+                        └→ 让 Q 的估计可靠，不会问"从没见过的动作好不好"
+```
+
+**β 的调节作用**：
+
+β 控制 Actor 偏离 VLA 的**自由度**：
+
+| β | 行为 | 场景 |
+|---|---|---|
+| **β=0** | Actor 完全自由，只追求 Q 最大化 | 容易发散，Q 估计爆炸 |
+| **β→∞** | Actor 完全复制 VLA | 等于没做 RL |
+| **β=1~10** | 在 VLA 附近做小修正 | **RLT 的默认设置**——只在参考动作附近微调 |
+
+**数据流图**：
+
+```
+# Actor 更新（每隔 d 步才执行一次，d 通常是 2-3）
+# 这是 TD3 的 "Delayed Policy Update" 技巧——让 Critic 先学稳，Actor 再更新
+
+a_current = actor(x, ref_actions)              # Actor 输出当前修正后的动作
+Q = min(critic_1(x, a_current), critic_2(x, a_current))  # 双 Critic 取最小值
+bc_loss = MSE(a_current, ref_actions[:, :C*32])  # 只约束前 C 步
+
+L_π = -Q.mean() + β * bc_loss                 # 总损失
+θ ← θ - α · ∇L_π                              # 梯度下降更新 Actor
+```
+
+##### 完整内循环伪代码
+
+```python
+# 超参数
+BATCH_SIZE = 256        # 每批采样数量
+G = 20                  # 每收集一次数据，内循环跑 20 次更新
+POLICY_DELAY = 2        # 每 2 次 Critic 更新才更新 1 次 Actor
+POLYAK_TAU = 0.005      # 目标网络软更新系数
+GAMMA = 0.99            # 折扣因子
+BETA = 2.0              # BC 正则化系数
+SMOOTH_NOISE = 0.2      # 目标平滑噪声标准差
+NOISE_CLIP = 0.5        # 噪声裁剪范围
+
+# 内循环
+for _ in range(G):
+    # Step 1: 从 Replay Buffer 采样
+    batch = replay_buffer.sample(BATCH_SIZE)
+    # batch.state     → [256, 2080]
+    # batch.action    → [256, 320]
+    # batch.reward    → [256, 1]
+    # batch.next_state → [256, 2080]
+    # batch.done      → [256, 1]
+
+    # Step 2: 更新 Critic
+    with torch.no_grad():
+        next_action = target_actor(batch.next_state)  # [256, 320]
+        noise = torch.randn_like(next_action) * SMOOTH_NOISE
+        noise = noise.clamp(-NOISE_CLIP, NOISE_CLIP)
+        next_action = (next_action + noise).clamp(-1, 1)
+        # 也可以 clamp 到动作空间的实际范围
+        q1_target = target_critic_1(batch.next_state, next_action)  # [256, 1]
+        q2_target = target_critic_2(batch.next_state, next_action)  # [256, 1]
+        q_target = batch.reward + GAMMA * (1 - batch.done) * torch.min(q1_target, q2_target)
+
+    q1 = critic_1(batch.state, batch.action)  # [256, 1]
+    q2 = critic_2(batch.state, batch.action)  # [256, 1]
+    critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+    critic_optimizer.zero_grad()
+    critic_loss.backward()
+    critic_optimizer.step()
+
+    # Step 3: 每 POLICY_DELAY 步更新一次 Actor
+    if step_count % POLICY_DELAY == 0:
+        current_action = actor(batch.state)  # [256, 320]
+        q = torch.min(critic_1(batch.state, current_action),
+                      critic_2(batch.state, current_action))
+        bc_loss = F.mse_loss(current_action, batch.ref_actions[:, :C*ACTION_DIM])
+        actor_loss = -q.mean() + BETA * bc_loss
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
+
+        # 软更新目标网络
+        for target_param, param in zip(target_critic_1.parameters(), critic_1.parameters()):
+            target_param.data.copy_(POLYAK_TAU * param + (1 - POLYAK_TAU) * target_param)
+        # 相同方式更新 target_critic_2 和 target_actor
+```
 
 | 方面 | pi0.6 (RECAP) | RLT (RL Token) |
 |---|---|---|
