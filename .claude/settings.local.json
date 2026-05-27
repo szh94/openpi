@@ -13,7 +13,12 @@
       "WebFetch(domain:www.pi.website)",
       "WebSearch",
       "WebFetch(domain:arxiv.org)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=\"D:/work/openpi/rlt_online_rl/src:$PYTHONPATH\" python -c \"\nfrom rlt_online_rl.actor import Actor\nfrom rlt_online_rl.critic import Critic\nprint\\('actor + critic imports OK'\\)\n\")"
     ]
   }
 }
