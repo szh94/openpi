@@ -6,6 +6,8 @@ import logging
 import pathlib
 from typing import Generic, TypeVar
 
+from typing_extensions import override
+
 import augmax
 from flax import nnx
 from flax import struct
@@ -33,6 +35,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    RLT = "rlt"
 
 
 # The model always expects these images
@@ -257,6 +260,47 @@ class BaseModelConfig(abc.ABC):
     def fake_act(self, batch_size: int = 1) -> Actions:
         _, action_spec = self.inputs_spec(batch_size=batch_size)
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
+
+
+@dataclasses.dataclass(frozen=True)
+class RLTBaseModelConfig(BaseModelConfig):
+    """Configuration for RLT (RL Token) models. Wraps a base VLA config with RLT parameters."""
+
+    # RL Token Encoder/Decoder config.
+    rl_token_width: int = 2048
+    rl_encoder_depth: int = 4
+    rl_encoder_num_heads: int = 8
+    # Actor's output horizon (action chunk size for online RL).
+    action_chunk: int = 10
+
+    # Proprioception dimension (robot state dim).
+    proprio_dim: int = 32
+
+    @property
+    @override
+    def model_type(self) -> ModelType:
+        return ModelType.RLT
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "BaseModel":
+        raise NotImplementedError("RLTBaseModelConfig does not create a model directly. Use a VLA config.")
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[Observation, Actions]:
+        # RLT wraps a VLA, so the input spec matches the underlying VLA spec.
+        # We return a minimal spec for the combined observation.
+        image_spec = jax.ShapeDtypeStruct([batch_size, *IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        with at.disable_typechecking():
+            observation_spec = Observation(
+                images={k: image_spec for k in IMAGE_KEYS},
+                image_masks={k: image_mask_spec for k in IMAGE_KEYS},
+                state=jax.ShapeDtypeStruct([batch_size, self.proprio_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, 200], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, 200], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_chunk, self.proprio_dim], jnp.float32)
+        return observation_spec, action_spec
 
 
 @dataclasses.dataclass

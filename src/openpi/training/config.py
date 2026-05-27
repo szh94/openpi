@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.rl_token as rl_token
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -963,6 +964,27 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    #
+    # RLT (RL Token) configs.
+    #
+    # RLT extends a frozen VLA with an RL Token Encoder-Decoder and online Actor-Critic.
+    # The base VLA config should be used for Stage 1 (encoder-decoder training) and Stage 2 (online RL).
+    #
+    # This debug config uses fake data for testing the RLT pipeline.
+    TrainConfig(
+        name="rlt_debug",
+        model=_model.RLTBaseModelConfig(
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="rlt_debug",
         wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.

@@ -99,6 +99,13 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # Projection layer for unifying suffix token embeddings (1024 -> 2048) for RLT feature extraction.
+        # Only used by get_token_embeddings().
+        if action_expert_config.width != paligemma_config.width:
+            self._suffix_emb_proj = nnx.Linear(action_expert_config.width, paligemma_config.width, rngs=rngs)
+        else:
+            self._suffix_emb_proj = lambda x: x
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -184,6 +191,59 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
+
+    @at.typecheck
+    def get_token_embeddings(
+        self, observation: _model.Observation
+    ) -> tuple[
+        at.Float[at.Array, "b n 2048"],
+        at.Float[at.Array, "b ah ad"],
+    ]:
+        """Return all VLA token embeddings (unified to 2048 dim) and reference actions.
+
+        This exposes the intermediate token representations needed for RLT. The VLA should be
+            frozen (stop-gradient applied) when training the RLT encoder.
+
+        Args:
+            observation: Model observation input.
+
+        Returns:
+            all_embeddings: Concatenated prefix+suffix token embeddings, shape [B, N, 2048].
+            ref_actions: Reference actions from VLA output, shape [B, action_horizon, action_dim].
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        batch_size = observation.state.shape[0]
+
+        # Embed prefix (images + text).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # Embed suffix with dummy noise (zeros) and t=1 (fully noisy, acts as identity for feature extraction).
+        dummy_noise = jnp.zeros((batch_size, self.action_horizon, self.action_dim))
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, dummy_noise, jnp.ones(batch_size)
+        )
+
+        # One full forward pass through the LLM.
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+        )
+
+        # Reference actions: decode the last action_horizon tokens.
+        ref_actions = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        # Unify suffix_out to 2048 dim and concatenate with prefix_out.
+        suffix_out_proj = self._suffix_emb_proj(suffix_out)
+        all_embeddings = jnp.concatenate([prefix_out, suffix_out_proj], axis=1)
+
+        return jax.lax.stop_gradient(all_embeddings), jax.lax.stop_gradient(ref_actions)
 
     @override
     def compute_loss(
