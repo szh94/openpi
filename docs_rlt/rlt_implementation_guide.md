@@ -6,9 +6,9 @@
 
 ## RLT 核心思想（一句话）
 
-> **冻住约 48.6 亿参数的 VLA 大模型（pi0.6），外挂一个 2-3 层 MLP 的 Actor-Critic 做在线 RL 微调**
+> **冻住约 48.6 亿参数的 VLA 大模型（pi0.6），外挂一个 2-3 层 MLP 的 Actor-Critic（AC 网络）做在线 RL 微调**
 
-核心创新是 **RL Token**：一个 Encoder-Decoder Transformer，把 VLA 最后一层输出的 N×2048 维 token 序列，压缩成一个 2048 维的"状态向量"，喂给轻量 Actor-Critic。
+核心创新是 **RL Token**：一个 Encoder-Decoder Transformer，把 VLA 最后一层输出的 N×2048 维 token 序列，压缩成一个 2048 维的"状态向量"，喂给轻量 Actor-Critic（AC 网络）。
 
 ---
 
@@ -833,10 +833,10 @@ for _ in range(G):
 
 | 方面 | RECAP（pi0.6 论文方法） | RLT（RL Token） |
 |---|---|---|---|---|
-| **方法** | 优势条件化 (Advantage Conditioning) | 在线 Actor-Critic (TD3 + BC) |
+| **方法** | 优势条件化 (Advantage Conditioning) | 在线 Actor-Critic（AC 网络）(TD3 + BC) |
 | **VLA 参数** | 重新训练整个 VLA | **冻结** VLA，只训练小模块 |
 | **数据需求** | 大量离线数据 + 自动收集数据 | 少量 demo + 15min-2h 在线数据 |
-| **额外模型** | 670M Value Function | 2-3 层 MLP Actor-Critic |
+| **额外模型** | 670M Value Function | 2-3 层 MLP Actor-Critic（AC 网络） |
 | **适合场景** | 从头训练通用策略 | 在已有 VLA 上快速微调 |
 | **精度** | 通用任务提升 | 高精度任务（拧螺丝、插线） |
 
