@@ -27,35 +27,35 @@
 
 **设计理由**：提供与现有服务基础设施兼容的干净 `BasePolicy` 接口，同时支持 RLT 推理流程。
 
-### 3. `rlt_online_rl/src/rlt_online_rl/actor.py` — Actor 网络
+### 3. `rlt_online_rl/actor.py` — Actor 网络
 
 - **`Actor`**：2 层 MLP（512 隐藏单元）。
 - 输入：`concat([state (2080), ref_actions_flat (1600)])` → `[3680]`。
 - 输出：`mean [320]` + `std [320]`（通过 softplus 裁剪的 log_std）。
 - 损失：`-Q + beta * MSE(a, ref_actions[:C])`（TD3 + BC）。
 
-### 4. `rlt_online_rl/src/rlt_online_rl/critic.py` — Critic 网络
+### 4. `rlt_online_rl/critic.py` — Critic 网络
 
 - **`Critic`**：2 层 MLP（256 隐藏单元），双副本用于 TD3。
 - 输入：`concat([state (2080), action_chunk_flat (320)])` → `[2400]`。
 - 输出：Q 值 `[1]`。
 - 特性：带 Polyak 软更新的目标网络（tau=0.005）。
 
-### 5. `rlt_online_rl/src/rlt_online_rl/replay.py` — 回放缓冲区
+### 5. `rlt_online_rl/replay.py` — 回放缓冲区
 
 - 容量高达 100 万条转换的循环缓冲区。
 - 每条记录：`(state [2080], action [320], reward [1], next_state [2080], done [1])`。
 - 均匀随机采样。
 - stride=2 存储，用于重叠转换（5 倍样本效率）。
 
-### 6. `rlt_online_rl/src/rlt_online_rl/learner.py` — TD3 + BC 学习器
+### 6. `rlt_online_rl/learner.py` — TD3 + BC 学习器
 
 - 更新 Critic：使用标准 TD3 目标最小化 TD 误差。
 - 更新 Actor：最大化 Q + BC 正则化（每 2 步延迟更新）。
 - 目标网络软更新（Polyak tau=0.005）。
 - `updates_per_step=20`：每条收集的转换被多次梯度步骤复用。
 
-### 7. `rlt_online_rl/src/rlt_online_rl/rollout.py` — Rollout 运行时
+### 7. `rlt_online_rl/rollout.py` — Rollout 运行时
 
 - 机器人交互循环：VLA → Encoder → Actor → 执行 C=10 步。
 - 块级转换存储，stride=2。
@@ -211,7 +211,7 @@ python -c "from openpi.training.config import get_config; cfg = get_config('rlt_
 python -c "from openpi.policies.rlt_policy import RLTPolicy; print('OK')"
 
 # 4. 在线 RL 模块
-cd rlt_online_rl/src && python -c "
+cd rlt_online_rl && python -c "
 from rlt_online_rl.actor import Actor;
 from rlt_online_rl.critic import Critic;
 from rlt_online_rl.replay import ReplayBuffer;

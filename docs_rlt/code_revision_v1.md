@@ -27,35 +27,35 @@ Based on *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* 
 
 **Rationale**: Provides a clean `BasePolicy` interface compatible with the existing serving infrastructure while supporting the RLT inference pipeline.
 
-### 3. `rlt_online_rl/src/rlt_online_rl/actor.py` — Actor Network
+### 3. `rlt_online_rl/actor.py` — Actor Network
 
 - **`Actor`**: 2-layer MLP (512 hidden units).
 - Input: `concat([state (2080), ref_actions_flat (1600)])` → `[3680]`.
 - Output: `mean [320]` + `std [320]` (via softplus-clamped log_std).
 - Loss: `-Q + beta * MSE(a, ref_actions[:C])` (TD3 + BC).
 
-### 4. `rlt_online_rl/src/rlt_online_rl/critic.py` — Critic Network
+### 4. `rlt_online_rl/critic.py` — Critic Network
 
 - **`Critic`**: 2-layer MLP (256 hidden units) with twin copies for TD3.
 - Input: `concat([state (2080), action_chunk_flat (320)])` → `[2400]`.
 - Output: Q-value `[1]`.
 - Features: target networks with Polyak soft updates (tau=0.005).
 
-### 5. `rlt_online_rl/src/rlt_online_rl/replay.py` — Replay Buffer
+### 5. `rlt_online_rl/replay.py` — Replay Buffer
 
 - Circular buffer with capacity up to 1M transitions.
 - Each entry: `(state [2080], action [320], reward [1], next_state [2080], done [1])`.
 - Uniform random sampling.
 - Stride=2 storage for overlapping transitions (5x sample efficiency).
 
-### 6. `rlt_online_rl/src/rlt_online_rl/learner.py` — TD3 + BC Learner
+### 6. `rlt_online_rl/learner.py` — TD3 + BC Learner
 
 - Updates Critic: minimize TD error using standard TD3 target.
 - Updates Actor: maximize Q + BC regularization (delayed every 2 steps).
 - Target network soft updates (Polyak tau=0.005).
 - `updates_per_step=20`: reuses each collected transition for multiple gradient steps.
 
-### 7. `rlt_online_rl/src/rlt_online_rl/rollout.py` — Rollout Runtime
+### 7. `rlt_online_rl/rollout.py` — Rollout Runtime
 
 - Robot interaction loop: VLA → Encoder → Actor → execute C=10 steps.
 - Chunk-level transition storage with stride=2.
@@ -211,7 +211,7 @@ python -c "from openpi.training.config import get_config; cfg = get_config('rlt_
 python -c "from openpi.policies.rlt_policy import RLTPolicy; print('OK')"
 
 # 4. Online RL modules
-cd rlt_online_rl/src && python -c "
+cd rlt_online_rl && python -c "
 from rlt_online_rl.actor import Actor;
 from rlt_online_rl.critic import Critic;
 from rlt_online_rl.replay import ReplayBuffer;

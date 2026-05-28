@@ -80,11 +80,11 @@ class RLTPolicy:
 
 | 文件 | 说明 |
 |---|---|
-| `rlt_online_rl/src/rlt_online_rl/actor.py` | **Actor 网络**：2-3 层 MLP，输入 (rl_token + state + ref_actions)，输出修正动作 |
-| `rlt_online_rl/src/rlt_online_rl/critic.py` | **Critic 网络**：2-3 层 MLP，输入 (rl_token + state + action_chunk)，输出 Q 值（TD3 双 Critic） |
-| `rlt_online_rl/src/rlt_online_rl/learner.py` | **TD3 + BC 训练循环**：从 Replay Buffer 采样 → 更新 Critic → 更新 Actor |
-| `rlt_online_rl/src/rlt_online_rl/replay.py` | **Replay Buffer**：存 (state, action, reward, next_state) |
-| `rlt_online_rl/src/rlt_online_rl/rollout.py` | **Rollout 运行时**：机器人交互、奖励计算、数据收集 |
+| `rlt_online_rl/actor.py` | **Actor 网络**：2-3 层 MLP，输入 (rl_token + state + ref_actions)，输出修正动作 |
+| `rlt_online_rl/critic.py` | **Critic 网络**：2-3 层 MLP，输入 (rl_token + state + action_chunk)，输出 Q 值（TD3 双 Critic） |
+| `rlt_online_rl/learner.py` | **TD3 + BC 训练循环**：从 Replay Buffer 采样 → 更新 Critic → 更新 Actor |
+| `rlt_online_rl/replay.py` | **Replay Buffer**：存 (state, action, reward, next_state) |
+| `rlt_online_rl/rollout.py` | **Rollout 运行时**：机器人交互、奖励计算、数据收集 |
 
 #### Actor 网络
 
