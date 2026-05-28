@@ -6,6 +6,8 @@ This document describes all changes made to implement RL Token (RLT) functionali
 
 Based on *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* (Physical Intelligence, 2026).
 
+> **Note on model versions**: The RLT paper uses **pi0.6** (Gemma 3 4B backbone + 860M action expert) as the base VLA. Our implementation builds on **pi0.5** (Gemma 2B + 300M action expert) from the openpi codebase, since pi0.6 is proprietary. The RLT method is architecture-agnostic and works with both models.
+
 ---
 
 ## Files Created
@@ -63,7 +65,7 @@ Based on *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* 
 
 ### 8. `scripts/train_rlt_token.py` — Stage 1 Training
 
-- Loads pre-trained pi0.5 VLA, freezes all params.
+- Loads pre-trained VLA (pi0.5/pi0.6), freezes all params.
 - Initializes RLTEncoder + RLTDecoder.
 - MSE reconstruction loss on VLA token embeddings.
 - After training, freezes encoder and discards decoder.

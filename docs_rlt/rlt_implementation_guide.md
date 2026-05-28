@@ -1,12 +1,12 @@
 # RLT (RL Token) 实现指南 — 基于 openpi 代码库
 
-> 基于 Physical Intelligence 论文 *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* (2026) 和 *π*₀.₆: a VLA That Learns From Experience* (2025)
+> 基于 Physical Intelligence 论文 *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* (2026)
 
 ---
 
 ## RLT 核心思想（一句话）
 
-> **冻住 50 亿参数的 VLA 大模型，外挂一个 2 层 MLP 的 Actor-Critic 做在线 RL 微调**
+> **冻住约 48.6 亿参数的 VLA 大模型（pi0.6），外挂一个 2-3 层 MLP 的 Actor-Critic 做在线 RL 微调**
 
 核心创新是 **RL Token**：一个 Encoder-Decoder Transformer，把 VLA 最后一层输出的 N×2048 维 token 序列，压缩成一个 2048 维的"状态向量"，喂给轻量 Actor-Critic。
 
@@ -294,7 +294,7 @@ Observation 输入
                                   └─────────────┘
 ```
 
-### 3.2 PI0.5 + RLT 推理流程（冻结 VLA + Actor 修正）
+### 3.2 PI0.6 + RLT 推理流程（冻结 VLA + Actor 修正）
 
 ```
   Observation 输入 (与 PI0.5 相同)
@@ -302,7 +302,7 @@ Observation 输入
         │
         ▼
   ┌──────────────────────────────────────────────────────┐
-  │               PI0.5 VLA (全部冻结)                    │
+  │               PI0.6 VLA (全部冻结)                    │
   │                                                       │
   │  1. embed_prefix → prefix_tokens [b, ~968, 2048]    │
   │  2. Transformer 前向 (prefix + suffix)               │
@@ -412,16 +412,20 @@ Observation 输入
 | | Actor 输出 a₁:C | `[b, 320]` | C=10 步, 每步 32 维, flatten |
 | | Q 值 | `[b, 1]` | Critic 输出标量 |
 
+> **关于 action_dim=32**：这是 VLA 预训练时对所有机器人动作空间取"最大公约数"的固定维度（见 pi0.5 论文）。RLT 原论文使用双臂 6-DOF 机器人（6+1+6+1=14 维），实际动作为 14 维。openpi 代码中 action_dim=32 是模型内部维度，低维机器人的多余维度会被填充为 0。具体使用时应只取你机器人对应的维度。
+
 ---
 
-## 4. 简明架构对比图 — PI0.5 vs PI0.6 RLT 新增模块
+## 4. 简明架构对比图 — 原始 VLA vs RLT 新增模块
 
-新手直接看这张图就够了。左侧是基础 PI0.5，右侧是 RLT 新增的部分（标 `+`）。
+新手直接看这张图就够了。左侧是基础 VLA（pi0.5/pi0.6），右侧是 RLT 新增的部分（标 `+`）。
+
+> **注意**：RLT 原论文使用 pi0.6，我们的实现基于 pi0.5。两种模型的架构原理相同，RLT 的适用不依赖具体版本。
 
 ### 4.1 宏观对比
 
 ```
-PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
+原始 VLA                                  VLA + RLT（在线 RL）
 ┌─────────────────────┐                  ┌─────────────────────────────────┐
 │                     │                  │                                 │
 │  Observation        │                  │  Observation                    │
@@ -429,8 +433,8 @@ PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
 │         │           │                  │         │                       │
 │         ▼           │                  │         ▼                       │
 │  ┌─────────────┐    │                  │  ┌─────────────┐               │
-│  │  PI0.5 VLA  │    │                  │  │  PI0.5 VLA  │ （冻结 ✅）    │
-│  │  (5B params)│    │                  │  │  (5B params)│               │
+│  │   VLA 模型  │    │                  │  │   VLA 模型  │ （冻结 ✅）    │
+│  │  (~5B params)│   │                  │  │  (~5B params)│              │
 │  │             │    │                  │  │             │               │
 │  │  输出动作   │    │                  │  │  输出:      │               │
 │  │  [50, 32]   │    │                  │  │  ① 动作 [50,32]            │
@@ -505,6 +509,7 @@ PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
 │                                                                     │
 │  网络: Linear(3680 → 512) → ReLU → Linear(512 → 512) → ReLU        │
 │        → Linear(512 → 320) → 输出修正动作均值 μ                      │
+│  （RLT 论文中简单任务用 2 层 256，复杂任务用 2-3 层 512）            │
 │        → softplus → 输出标准差 σ                                     │
 │                                                                     │
 │  输出: action_chunk a₁:C  [b, 320]  ← C=10 步, 每步 32 维, flatten │
@@ -583,7 +588,7 @@ PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
 
 | 模块 | 一句话作用 | 是否冻结 |
 |---|---|---|
-| **PI0.5 VLA** | 基础视觉-语言-动作大模型, 输出参考动作 | ✅ 冻结 |
+| **VLA（pi0.5/pi0.6）** | 基础视觉-语言-动作大模型，输出参考动作 | ✅ 冻结 |
 | **RL Token Encoder** | 把 VLA 内部几千个 token 压缩成一个状态向量 | ✅ 冻结 |
 | **RL Token Decoder** | Stage 1 训练 Encoder 用的"翻译器" (重建 token) | ✅ 冻结 (训练完即弃) |
 | **Actor** | 参考动作上做小修正, 让它更"好"（Q 值更高） | ❌ 在线训练 |
@@ -598,7 +603,7 @@ PI0.5（原始 VLA）                        PI0.6 RLT（VLA + 在线 RL）
 
 ```python
 # scripts/train_rlt_token.py
-1. 加载预训练 VLA（pi0.5），冻结所有参数
+1. 加载预训练 VLA（pi0.5/pi0.6），冻结所有参数
 2. 初始化 Encoder-Decoder ϕ
 3. 在任务 demo 数据上训练:
    for batch in dataloader:
@@ -826,8 +831,8 @@ for _ in range(G):
         # 相同方式更新 target_critic_2 和 target_actor
 ```
 
-| 方面 | pi0.6 (RECAP) | RLT (RL Token) |
-|---|---|---|
+| 方面 | RECAP（pi0.6 论文方法） | RLT（RL Token） |
+|---|---|---|---|---|
 | **方法** | 优势条件化 (Advantage Conditioning) | 在线 Actor-Critic (TD3 + BC) |
 | **VLA 参数** | 重新训练整个 VLA | **冻结** VLA，只训练小模块 |
 | **数据需求** | 大量离线数据 + 自动收集数据 | 少量 demo + 15min-2h 在线数据 |

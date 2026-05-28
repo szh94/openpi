@@ -6,6 +6,8 @@
 
 基于论文 *RL Token: Bootstrapping Online RL with Vision-Language-Action Models* (Physical Intelligence, 2026)。
 
+> **模型版本说明**：RLT 原论文使用 **pi0.6**（Gemma 3 4B 主干 + 860M action expert）作为基座 VLA。我们的实现基于 openpi 代码库的 **pi0.5**（Gemma 2B + 300M action expert），因为 pi0.6 未开源。RLT 方法与具体模型版本无关，两种架构均可适用。
+
 ---
 
 ## 创建的文件
@@ -63,7 +65,7 @@
 
 ### 8. `scripts/train_rlt_token.py` — Stage 1 训练
 
-- 加载预训练的 pi0.5 VLA，冻结所有参数。
+- 加载预训练的 VLA（pi0.5/pi0.6），冻结所有参数。
 - 初始化 RLTEncoder + RLTDecoder。
 - 在 VLA token 嵌入上计算 MSE 重建损失。
 - 训练完成后冻结编码器，丢弃解码器。
