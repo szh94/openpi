@@ -842,6 +842,306 @@ for _ in range(G):
 
 ---
 
+## 6. AC 网络训练详解
+
+> 这部分深入讲解 Actor 和 Critic 两个网络在训练过程中的"博弈"关系、梯度流动、以及实际调参经验。理解这些对实现和调试 RLT 至关重要。
+
+### 6.1 训练全貌：两个网络如何协同
+
+```
+环境 ──→ (state, ref_actions) ──→ Actor ──→ action ──→ 环境（执行）
+                                      │                      │
+                                      │                      ▼
+                                      │                reward + next_state
+                                      ▼                      │
+                                   Critic ←──────────────────┘
+                                      │
+                                      ▼
+                               Q(s, a) — 指导 Actor 更新
+```
+
+Actor 和 Critic 的关系可以理解为 **"学生与老师"的动态博弈**：
+
+| 角色 | 类比 | 目标 | 训练信号 |
+|---|---|---|---|
+| **Actor** | 学生 | 输出"好"的动作 | 从 Critic 的 Q 值学习 |
+| **Critic** | 老师 | 准确评估动作的好坏 | 从环境奖励学习 |
+
+**关键矛盾**：老师（Critic）一开始也是"新手"，给出的评分不一定准确。学生（Actor）如果太听老师的话，可能学到错误的东西。这就是为什么需要 **TD3 的延迟更新机制**——让老师先多学几轮，学得更准了再指导学生学习。
+
+### 6.2 Critic 训练的底层逻辑
+
+#### 6.2.1 Critic 到底在学什么？
+
+Critic 是一个 **Q 函数近似器**，它的目标是学会回答：
+
+> "在状态 s 下做动作 a，未来能获得多少累积奖励？"
+
+即：`Q(s, a) = E[r₀ + γ·r₁ + γ²·r₂ + ... | s₀=s, a₀=a]`
+
+但这无法直接监督学习，因为我们拿不到真正的"未来累积奖励"标签。所以 Critic 用 **TD learning（时序差分学习）** 来训练：
+
+```
+标签 ˆQ = r + γ · Q_target(s', a')    ← 用"当前估计"构造"标签"
+预测 Q  = Q_current(s, a)              ← 网络当前输出
+损失   = MSE(Q - ˆQ)                   ← 让预测逼近标签
+```
+
+**这本质上是 bootstrap（自助法）**：用自己（或自己的旧版本）的估计来构造训练标签。类似"用昨天的预测来校正今天的预测"。
+
+#### 6.2.2 TD3 三个技巧的直观理解
+
+| 技巧 | 类比 | 为什么需要 |
+|---|---|---|
+| **双 Critic** | 请两个独立的老师评分，取较低的分数 | 单个老师可能"过度乐观"，给烂动作打高分 → Actor 被误导 |
+| **目标网络** | 老师不用今天的标准打分，用上周的标准 | 防止"今天标准今天用"导致的正反馈振荡 |
+| **目标平滑** | 评分时稍微模糊化输入的动作 | 防止老师在个别动作上"钻牛角尖"（过拟合） |
+
+这些技巧的共同目的：**防止 Q 值被高估（overestimation bias）**。
+
+#### 6.2.3 Critic 梯度流
+
+```
+输入: batch.state [256, 2080], batch.action [256, 320]
+                │                      │
+                └──────────┬───────────┘
+                           ▼
+                    Critic MLP (2-3 层)
+                           │
+                           ▼
+                      Q 值 [256, 1]
+                           │
+                     ┌─────┴─────┐
+                     ▼           ▼
+               Q_target(固定)  Q_pred(可变)
+                     │           │
+                     └─────┬─────┘
+                           ▼
+                     MSE Loss (标量)
+                           │
+                    backward() ← 梯度只流向 Critic 的参数
+                           │
+                           ▼
+                   Critic 参数更新 ψ ← ψ - α·∇L_Q
+```
+
+**注意**：Q_target 是用 `torch.no_grad()` 计算的，梯度不会流过目标网络。只有 Q_pred 这一侧有梯度。
+
+### 6.3 Actor 训练的底层逻辑
+
+#### 6.3.1 Actor 的"偷师"过程
+
+Actor 的训练方式非常巧妙——它**不直接从环境 reward 学习**，而是**从 Critic 的 Q 值学习**：
+
+```
+Actor 更新方向：让 Q(s, Actor(s)) 变大
+                ↑
+         Critic 告诉 Actor 哪个方向是"更优"
+```
+
+梯度链：
+
+```
+state [256, 2080], ref_actions [256, 1600]
+                │           │
+                └─────┬─────┘
+                      ▼
+                Actor MLP (2-3 层)
+                      │
+                      ▼
+               action [256, 320] ←── 这是可微的！
+                      │
+                      ▼
+           ┌──────────┴──────────┐
+           │   Critic (冻结!)    │ ←── 这里不更新 Critic
+           │   只做前向传播       │
+           └──────────┬──────────┘
+                      │
+                      ▼
+                  Q 值 [256, 1]
+                      │
+                 L = -Q.mean()    ← 梯度反向通过 Critic 传到 Actor
+                      │
+                      ▼
+            Actor 参数更新 θ ← θ - α·∇L_π
+```
+
+**关键洞察**：Critic 在这里充当了一个"可微分的目标函数"。Actor 通过 Critic 的梯度信号，知道"往哪个方向调整动作能让 Q 值变大"。这就是 **policy gradient 的"重参数化技巧"**——把策略梯度转化为 Critic 对动作的梯度。
+
+#### 6.3.2 BC 正则化的梯度效应
+
+BC 正则项 `β · ‖a - ref_actions‖²` 的梯度指向 **VLA 参考动作**：
+
+```
+总梯度 = ∇(-Q) + β · ∇(MSE)
+
+∇(-Q): 指向"Q 值增长最快的方向"（探索性）
+       ↓
+β·∇(MSE): 指向"拉回 VLA 参考动作的方向"（保守性）
+       ↓
+合力方向: 在 VLA 附近寻找 Q 值更高的动作
+```
+
+这就是 **"安全探索"** 的数学本质：Actor 被允许偏离 VLA，但不能太远。
+
+#### 6.3.3 延迟更新（Delayed Policy Update）
+
+TD3 中 Actor 的更新频率比 Critic 低（通常每 2-3 次 Critic 更新才更新一次 Actor）：
+
+```
+时间步  1  2  3  4  5  6  7  8  9  10 ...
+Critic  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓
+Actor        ✓        ✓        ✓
+```
+
+**原理**：Critic 必须先学得相对准确，才能给 Actor 提供有用的梯度。如果 Actor 更新太快，会在 Critic 还不准确的区域"乱撞"。用公式表达：
+
+```
+Critic 误差大 → Q 面有"假峰" → Actor 冲向假峰 → 策略变差
+                   ↑
+          延迟更新打断了这个循环
+```
+
+#### 6.3.4 参考动作 Dropout 的作用
+
+训练时以 50% 概率把 ref_actions 置零：
+
+```
+情况 1 (50%): ref_actions = 0          → Actor 完全靠自己探索
+情况 2 (50%): ref_actions = VLA 输出    → Actor 有参考
+```
+
+**目的**：防止 Actor **过度依赖参考动作**。如果 Actor 总是看到 VLA 的参考动作，它可能学会"直接复制参考动作 + 微小修正"的懒惰策略。Dropout 强迫 Actor 在某些时刻完全依靠 RL Token 中的语义信息来决策，从而学到更鲁棒的动作表示。
+
+这与 dropout 防止神经网络过拟合的原理异曲同工——防止 Actor "过度依赖"某一个输入特征。
+
+### 6.4 优化器与超参数详解
+
+#### 6.4.1 优化器选择
+
+RLT 论文和常见实现中的默认选择：
+
+| 组件 | 优化器 | 学习率 | 其他参数 |
+|---|---|---|---|
+| Actor | AdamW | 3e-4 | weight_decay=1e-5 |
+| Critic | AdamW | 3e-4 | weight_decay=1e-5 |
+| *(两个网络可以使用相同或不同的 lr，一般相同)* | | | |
+
+**为什么用 AdamW 而不是 Adam？**
+- AdamW 的权重衰减（weight decay）与自适应学习率解耦
+- 对 2-3 层小 MLP 来说，weight decay 帮助防止 Critic 在 Q 面上产生尖锐的"伪峰"
+- 实验表明 AdamW 的训练稳定性优于 Adam
+
+#### 6.4.2 核心超参数速查表
+
+| 参数 | 默认值 | 作用 | 调参方向 |
+|---|---|---|---|
+| **BC 系数 β** | 2.0 | 控制 Actor 偏离 VLA 的程度 | ↑ 任务简单/奖励稀疏时增大；↓ 需要大幅度改进时减小 |
+| **Action Chunk C** | 10 | 每次决策预测多少步 | ↑ 高动态任务增大；↓ 需要精细控制时减小 |
+| **折扣因子 γ** | 0.99 | 多看重远期奖励 | ↑ 长 horizon 任务；↓ 短 horizon 任务 |
+| **Polyak τ** | 0.005 | 目标网络更新速度 | ↑ 训练不稳定时增大；↓ 训练抖动时减小 |
+| **延迟更新频率 d** | 2 | 每 d 步 Critic 更新一次 Actor | ↑ Critic 难度大时增大（让 Critic 先学稳）|
+| **目标平滑噪声 σ** | 0.2 | 目标 Q 计算时对下一动作加的噪声 | ↑ 鼓励 Critic 平滑化；↓ 任务精度要求高时减小 |
+| **Replay Buffer 容量** | 1e6 | 能存多少历史 transition | ↑ 任务模式多时增大 |
+| **Batch Size** | 256 | 每次采样多少条 transition | ↑ 梯度更稳但更慢 |
+
+#### 6.4.3 β 的调参原则
+
+β 是最重要的超参数，直接决定 Actor 的行为：
+
+```
+β → 0:     Actor 完全自由 → 可能找到 Q 面的"假峰" → 动作离奇
+β = 1-5:   在 VLA 附近"微调" → RLT 的理想工作区间
+β → ∞:     Actor 完全复制 VLA → 跟没做 RL 一样
+```
+
+**快速调参法**：
+1. 先用 β=2 跑一次训练
+2. 观察 rollout 中 Actor 的输出动作与 ref_actions 的 MSE：
+   - MSE < 0.01：β 太大（Actor 几乎没改动作），降低 β
+   - MSE > 0.5：β 太小（Actor 飞得太远），增大 β
+   - MSE ≈ 0.05-0.2：合适的范围
+
+### 6.5 训练稳定性分析与调试
+
+#### 6.5.1 常见训练崩溃模式
+
+| 崩溃模式 | 现象 | 原因 | 解决方法 |
+|---|---|---|---|
+| **Q 值爆炸** | Q 值持续增长到 >1000 | 双 Critic 没对齐或 target network 更新太快 | 降低 τ，增加目标平滑噪声 |
+| **策略坍塌** | Actor 输出恒为零或恒定值 | Actor 找到了 Q 面的伪高峰 | 增大 β，增大动作 dropout |
+| **Critic 震荡** | Q 值在训练过程中反复跳变 | 学习率过高或 batch size 太小 | 降低 lr，增大 batch size |
+| **动作过激** | Actor 输出远超出正常动作范围 | β 太小，BC 正则不足以约束 Actor | 增大 β，检查动作 clamp 范围 |
+
+#### 6.5.2 训练监控指标
+
+训练时应该实时监控以下指标：
+
+```
+1. Q 值 (critic_q1, critic_q2):
+   - 正常: 缓慢上升并趋于稳定
+   - 异常: 迅速增长 → Q 值高估
+
+2. Actor loss / Q 项 (actor_loss_q):
+   - 正常: 逐渐下降（Q 值上升）
+   - 异常: 剧烈波动 → 训练不稳定
+
+3. BC loss (actor_loss_bc):
+   - 正常: 维持在小值 (~0.05-0.2)
+   - 异常: 趋近 0 → β 太大；激增 → β 太小
+
+4. 动作标准差 (action_std):
+   - 正常: 训练初期较大 → 逐渐衰减
+   - 异常: 过早降为 0 → 探索不足
+
+5. 平均 reward:
+   - 正常: 逐渐上升并收敛
+   - 异常: 不升反降 → 训练有问题
+```
+
+#### 6.5.3 梯度流动检查
+
+调试时首先要确认 **梯度确实流到了 Actor**（一个常见的 bug 是某个环节断开了梯度链）：
+
+```python
+# 检查 Actor 的梯度是否正常
+for name, param in actor.named_parameters():
+    if param.grad is not None:
+        print(f"{name}: grad_norm = {param.grad.norm().item():.6f}")
+    else:
+        print(f"{name}: NO GRADIENT!")  # ← 这里有问题
+```
+
+常见断梯度原因：
+- 用了 `torch.no_grad()` 包裹了不该包裹的地方
+- `detach()` 放在了错误的位置
+- Actor 和 Critic 之间用了 `stop_gradient`
+
+### 6.6 AC 网络参数初始化
+
+正确的初始化对训练稳定性很重要：
+
+```python
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        # 最后一层用更小的初始化，让初始策略接近 VLA
+        if getattr(m, 'is_output_layer', False):
+            nn.init.xavier_uniform_(m.weight, gain=0.01)
+            nn.init.zeros_(m.bias)
+        else:
+            nn.init.xavier_uniform_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+actor.apply(init_weights)
+critic.apply(init_weights)
+```
+
+**为什么 Actor 输出层要用更小的权重初始化？**
+
+训练开始时最好让 Actor 输出 ≈ 0（即修正量为 0），这样初始策略 ≈ VLA 参考动作。如果输出层初始化太大，初始动作会严重偏离 VLA，导致 Critic 在训练初期就要处理大量 out-of-distribution 的动作，很容易崩溃。
+
+---
+
 ## 7. 参考资料
 
 - [RL Token: Bootstrapping Online RL with Vision-Language-Action Models](https://browse-export.arxiv.org/abs/2604.23073) — RLT 原论文
