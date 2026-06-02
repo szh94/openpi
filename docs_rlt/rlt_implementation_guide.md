@@ -46,6 +46,284 @@ L_ro(ϕ) = E[ Σ_i ‖h_ϕ(d_ϕ([z_rl, ẑ₁:i-1]))_i - ẑ_i‖² ]
 - Encoder ϕ 和 Decoder ϕ 共享参数
 - 训练完成后 **VLA + Encoder + Decoder 全部冻结**
 
+#### Stage 1 训练深度解析：RL Token 的信息代表性
+
+##### 核心问题
+
+> 为什么把 N × 2048 维的 token 序列压缩成单个 2048 维的向量，关键信息不会丢失？
+
+这是 RLT 最核心的理论问题。下面从信息论、架构设计和训练动态三个层面详细分析。
+
+---
+
+##### 一、信息瓶颈视角：最小充分统计量
+
+将 RL Token 理解为 VLA embeddings 的 **最小充分统计量（minimal sufficient statistic）**：
+
+```
+I(embeddings; RL_token) → max     ← 最大化信息保留（通过 MSE 重建）
+H(RL_token) → 约束为 2048 维       ← 瓶颈维度约束（过滤噪声）
+```
+
+Stage 1 的训练目标等价于最大化互信息下界：
+
+```
+L_recon(ϕ) = E[‖decoder(encoder(embeddings)) - embeddings‖²]
+
+→ 最小化 MSE = 最大化 I(embeddings; RL_token) 的下界
+                （根据信息瓶颈理论，重建误差是互信息的变分上界）
+```
+
+当重建误差趋近于零时，RL Token 包含了**足以完整重建原始 embeddings 的全部信息**。这意味着原始 embeddings 中的任何对下游任务有意义的信息（物体位置、关节状态、任务指令）都被保留在了 RL Token 中。
+
+**关键洞察**：压缩维度为 2048 不是因为信息量只需要 2048 维，而是因为原始 VLA 的隐藏维度就是 2048。RL Token 的容量与 VLA token 的每个位置的容量相同——信息损失来自"从 N 个位置到 1 个位置的聚合"，而非来自"维度降低"。
+
+---
+
+##### 二、架构设计如何保证信息保留
+
+###### 2.1 全注意力机制：[RL] Token 可以"看到"所有输入
+
+```python
+# rl_token.py:209-217
+rl_tok = jnp.broadcast_to(jnp.asarray(self.rl_token), (B, 1, D))
+x = jnp.concatenate([embeddings, rl_tok], axis=1)  # [B, N+1, D]
+
+# 全注意力 mask（所有 token 互相可见）
+mask = jnp.ones((B, N + 1, N + 1), dtype=jnp.bool_)
+```
+
+与池化操作（mean/max pooling）的本质区别：
+
+| 方法 | 信息聚合方式 | 问题 |
+|------|-------------|------|
+| **Mean Pooling** | 所有位置取平均，权重相同 | 假设所有 token 同等重要—破坏空间结构 |
+| **Max Pooling** | 每维取最大值 | 只保留最显著特征—忽略细粒度信息 |
+| **RL Token (Ours)** | 每个 [RL] token 通过注意力自适应加权 | **保留"哪些 token 重要"的选择权给模型学习** |
+
+全注意力 mask 意味着 [RL] token 可以通过 4 层 Transformer 的注意力头，学习到对每个输入 token 的差异化权重。对于抓取任务，视觉 token 可能获得更高权重；对于精密操作，动作 token 可能更重要。
+
+###### 2.2 4 层 Transformer 的容量分析
+
+```
+宽度 2048  ×  深度 4 层  ×  8 个注意力头
+
+每层参数量 ≈ 4 × 2048² (QKV+O) + 2 × 2048 × 8192 (MLP, mlp_ratio=4.0)
+           ≈ 16M + 33M ≈ 49M 参数/层
+总参数量 ≈ 4 × 49M ≈ 196M 参数
+```
+
+从容量上看：
+
+- **足够做复杂聚合**：196M 参数可以学习到各 token 之间复杂的依赖关系（"物体 A 的位置 token + 机械臂状态 token → 决定 gripper 应该张开的程度"）
+- **不会过拟合 VLA embeddings**：相对于 VLA（5B 参数），Encoder 的 196M 是小模块，迫使它学习通用压缩模式而非记忆特定样本
+
+###### 2.3 可学习的 [RL] 特殊 Token
+
+初始化：`self.rl_token = nnx.Param(jax.random.normal(...) * 0.02)`
+
+- 初始化为小随机值，避免初始偏差
+- 在训练中通过梯度下降优化（从重建损失中学习"哪些信息必须保留"）
+
+###### 2.4 位置编码保留空间结构
+
+```python
+self.pos_embed = nnx.Param(jax.random.normal(..., (1, max_len, config.width)) * 0.02)
+x = x + jnp.asarray(self.pos_embed[:, :N + 1, :])
+```
+
+- 可学习的绝对位置编码让 [RL] token 不仅能选择"关注哪个 token"，还能选择"关注哪个位置的 token"
+- 例如：前 768 个 token 是视觉特征，后 200 个 token 是语言特征 — [RL] token 可以通过位置区分它们
+
+---
+
+##### 三、Decoder 的信息压力测试
+
+Decoder 的存在是确保信息保留的**最关键机制**：
+
+```
+输入 → Encoder → [2048] → Decoder → 重建 N × 2048
+                                          ↓
+                                    MSE (N × 2048 个值)
+```
+
+这里的 MSE 是 **N × 2048 = ~2M 个标量值的平均误差**。Decoder 必须从单个 2048 维向量中重建出约 2M 个值。
+
+**信息量计算**：
+
+| 环节 | 信息容量 | 说明 |
+|------|---------|------|
+| 输入 embeddings | N × 2048 × 16 bits ≈ 16 Mbits | 假设 float16, N≈1000 |
+| RL Token | 2048 × 16 bits ≈ **32 Kbits** | 压缩比 ≈ 500:1 |
+| 重建输出 | 同输入 ≈ 16 Mbits | 恢复原始大小 |
+
+表面上压缩比高达 500:1，但请注意：
+
+1. **VLA embeddings 并非独立同分布**：N 个 token 之间存在大量冗余（相邻视觉 patch 高度相关，语言 token 之间存在句法依赖）
+2. **Encoder 的注意力机制利用相关性**：相似的 token 可以被压缩到同一子空间的不同维度
+3. **实际信源熵远小于 N × 2048 × 16 bits**：有效信息量可能只有几十 Kbits
+
+这正是 **Decoder 重建任务的意义**：
+- 如果 MSE 降到很低 → 证明 RL Token 确实包含了足够的信息来重建全部 embeddings
+- 如果 MSE 降不下去 → 说明 2048 维是瓶颈，需要增大容量或改架构
+
+**经验结果**（来自 RLT 论文）：在 30K 训练步后，重建 MSE 收敛到 ~0.01，说明 2048 维对于 VLA token embeddings 的"有效信息"是足够的。
+
+---
+
+##### 四、自回归式重建 vs 一次性重建
+
+```python
+# Decoder 的训练方式（rl_token.py:243-246）
+self.query_tokens = nnx.Param(         # 可学习的查询 token
+    jax.random.normal(rngs.params(), (1, max_len, config.width)) * 0.02
+)
+```
+
+RLT Decoder 不是简单的"把 RL Token 复制 N 份过 MLP"，而是使用 **可学习的独立查询 token + cross-attention**：
+
+```
+RL Token [2048]
+    │
+    ▼
+Cross-Attention: 查询 = 可学习 query_tokens [N, 2048]
+                 键/值 = RL Token [1, 2048]
+    │
+    ▼
+重建 embeddings [N, 2048]
+```
+
+**为什么不是线性投影？** 线性投影假设 N 个输出位置**相互独立**，但 VLA 的 token 序列有明显的结构（前 768 是图像，接着是文本，最后是动作）。Cross-attention + 独立 query 让 Decoder 可以：
+
+1. 不同的 query token 关注 RL Token 的不同子空间
+2. 自回归式的逐位置重建捕捉 token 之间的依赖关系
+3. 从单个 RL Token 中"解压缩"出结构化信息
+
+**这相当于给 Encoder 施加了额外的结构约束**：RL Token 不能只是"乱序的信息包"，而必须以某种可解构的方式组织信息，让不同位置的 query 能提取到对应位置所需的信息。
+
+---
+
+##### 五、与其他压缩方案的对比
+
+| 方案 | 表达能力 | 结构保持 | 信息保留上限 | 计算开销 | RLT 选择的原因 |
+|------|---------|---------|------------|---------|--------------|
+| **Mean Pooling** | ❌ 低 | ❌ 丢失 | 低（均匀混合） | 极低 | — |
+| **Max Pooling** | ❌ 低 | ❌ 丢失 | 低（只保留极值） | 极低 | — |
+| **Attention Pooling** | ✅ 中 | ⚠️ 部分 | 中（单层线性加权） | 低 | — |
+| **Transformer Encoder + [RL]** | ✅✅ 高 | ✅ 保留 | **高（非线性交互+位置感知）** | 中 | ✅ |
+| **所有 token 拼接（不压缩）** | — | — | ✅ 完全保留 | ❌❌ 极高（~2M 维） | Actor 无法处理 |
+
+**为什么不能直接用所有 token？** Actor 是 2-3 层 MLP（512 隐藏层）：
+
+- 输入 ~2000 个 2048 维 token → 4M 维输入 → 参数爆炸（512 × 4M ≈ 2B）
+- 即使内存允许，MLP 也无法有效处理可变长度的序列
+- **Transformer Encoder 将变长序列转化为定长向量，是必要的维度规约**
+
+---
+
+##### 六、训练动态与信息保留的验证
+
+###### 6.1 训练曲线解读
+
+```
+MSE Loss
+│
+│   ╲
+│    ╲
+│     ╲
+│      ╲
+│       ╲
+│        ╲──────── 收敛到 ≈ 0.01
+└────────────────── 训练步数
+      30K
+```
+
+| 阶段 | 现象 | 信息状态 |
+|------|------|---------|
+| 训练初期 | MSE 高（~1.0） | RL Token 尚未学会压缩，信息大量丢失 |
+| 训练中期 | MSE 快速下降 | Encoder 学习选择性聚合，Decoder 学习解压缩 |
+| 训练后期 | MSE 趋于平稳 | RL Token 达到信息容量上限，收敛到近似最优压缩 |
+| 收敛后 | MSE ≈ 0.01 | 重建误差极小 → **RL Token 包含了足够的信息** |
+
+###### 6.2 信息保留的充分条件
+
+从理论上，如果重建损失满足：
+
+```
+E[‖decoder(encoder(embeddings)) - embeddings‖²] < ε
+```
+
+则对于任意 Lipschitz 连续的 Actor 函数 f：
+
+```
+|f(decoder(encoder(embeddings))) - f(embeddings)| < L · ε
+```
+
+其中 L 是 f 的 Lipschitz 常数。这意味着：
+- 如果 Actor 只依赖于 embeddings 中的信息
+- 且重建误差足够小
+- 那么 Actor 在 RL Token 上的表现与在原始 embeddings 上**几乎相同**
+
+即：**RL Token 是原始 embeddings 的 ε-近似充分统计量**。
+
+###### 6.3 如何验证信息保留
+
+在实际实现中，可以通过以下实验验证：
+
+```python
+# 实验 1：重建质量检查
+reconstructed = decoder(rl_token)
+recon_error = jnp.mean(jnp.square(reconstructed - embeddings))
+print(f"重建 MSE: {recon_error:.6f}")
+# 期望: < 0.05
+
+# 实验 2：一致性检查（不同视角的同一场景，RL Token 应相似）
+rl_token_1 = encoder(embeddings_1)
+rl_token_2 = encoder(embeddings_2)
+similarity = jnp.dot(rl_token_1, rl_token_2.T) / (norm(rl_token_1) * norm(rl_token_2))
+print(f"相似场景 RL Token 余弦相似度: {similarity:.4f}")
+
+# 实验 3：对比 RL Token 与原始 embeddings 在简单探测任务上的表现
+# 例如：用线性探针预测机械臂末端位置
+accuracy_rl = probe(rl_token, target)
+accuracy_raw = probe(embeddings.mean(axis=1), target)
+print(f"RL Token 探针准确率: {accuracy_rl:.3f}, Mean Pooling: {accuracy_raw:.3f}")
+```
+
+---
+
+##### 七、总结：为什么 1 个 RL Token 就够了
+
+```
+压缩过程：
+N × 2048  ← VLA 的完整表示
+    │
+    ├─ 图像 token (768个)：高度冗余（相邻 patch 几乎相同）
+    ├─ 文本 token (~200个)：语义紧凑但维度高
+    └─ 动作 token (50个)：时序上平滑变化，冗余度高
+    │
+    ▼
+4 层 Transformer Encoder ← 自适应选择、去冗余、重组合
+    │
+    ▼
+1 × 2048  ← RL Token
+    │
+    ├─ ✗ 不是"压缩"—而是"提炼"
+    ├─ ✗ 不是"降维"—而是"聚合"
+    └─ ✓ 是"充分统计量"—包含决策所需的全部信息
+```
+
+| 理论依据 | 解释 |
+|---------|------|
+| **信息瓶颈理论** | 最大化 I(RL_token; embeddings) ≈ 最小化 MSE |
+| **充分统计量** | 重建损失趋近 0 → RL Token 包含重建所需的全部信息 |
+| **架构保证** | 全注意力 + 4 层 Transformer + 可学习 [RL] token → 自适应信息聚合 |
+| **Decoder 压力测试** | 从 1 个 token 重建 N 个 token → 迫使 Encoder 保留所有关键信息 |
+| **维度分析** | 2048 = VLA 隐藏维度（非降维，仅聚合位置） |
+| **经验验证** | 论文中 MSE 收敛到 ~0.01，下游 RL 性能接近不压缩的上限 |
+
+> **一句话结论**：RL Token 不是"暴力压缩"，而是 Transformer Encoder 通过全注意力在所有 token 之间做**自适应信息提炼**，通过 Decoder 重建损失的监督信号保证不遗漏关键信息。2048 维不是瓶颈——真实的容量限制在注意力的选择性聚合，而非维度本身。
+
 ---
 
 ### 1.2 策略层
