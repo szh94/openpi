@@ -687,3 +687,92 @@ RLT 原论文使用 pi0.6（6.3B），在 H100 上 VLA 推理约 **200ms**，机
 | 解决方案 | — | ① 降低控制频率 ② 异步流水线 ③ 更快的硬件 |
 
 **核心 trade-off**：RLT 用 5 倍的 VLA 推理量换来了每 10 步一次重规划的精度优势。对精密操作来说，跑得快但位置不准，不如慢一点但每步都对准。
+
+---
+
+## Q8: 从 Windows + uv 切换到 Ubuntu + conda 后，代码需要做哪些修改？
+
+**几乎不需要修改核心代码。** 下面列出需要关注的点。
+
+### pyproject.toml — 不需要修改
+
+JAX 版本已经在 `pyproject.toml` 中用 `sys_platform` 做了平台区分：
+
+```toml
+# pyproject.toml:18-19
+"jax[cuda12]==0.5.3; sys_platform == 'linux'",   # Ubuntu 下装 CUDA 版
+"jax[cpu]==0.5.3; sys_platform == 'win32'",      # Windows 下装 CPU 版
+```
+
+Ubuntu + conda 下 `pip install -e .` 会自动安装 `jax[cuda12]`，不需要改。
+
+### uv.lock — 不需要修改，甚至可以忽略
+
+`uv.lock` 是 **uv 专用**的锁文件。conda 环境下使用 `pip install`，不涉及 `uv.lock`，可以直接无视。
+
+### 唯一需要改的：测试脚本中的强制 CPU 模式
+
+`examples/test_rlt_inference.py` 中原有一行强制 CPU 的代码，已通过新增 `--cpu` 标志解决：
+
+```python
+# 以前（硬编码 CPU，Windows 专用）：
+jax.config.update("jax_platform_name", "cpu")
+
+# 现在（通过 --cpu 标志控制）：
+if args.cpu:
+    jax.config.update("jax_platform_name", "cpu")
+```
+
+**Ubuntu + GPU 默认用法**（删除强制 CPU 后 JAX 自动检测 GPU）：
+
+```bash
+python examples/test_rlt_inference.py
+```
+
+**需要强制 CPU 时**：
+
+```bash
+python examples/test_rlt_inference.py --cpu
+```
+
+### sys.path — conda 下同样需要
+
+`rlt_online_rl` 是一个**顶层目录但不是一个可安装的包**（它没有 `pyproject.toml`，不在 workspace members 中）。测试脚本中的这段代码在 Ubuntu 上同样必要：
+
+```python
+# 确保项目根目录在 sys.path 中（rlt_online_rl 是顶层包，不在 src/ 下）
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+```
+
+### 对比总结
+
+| 项目 | Windows + uv | Ubuntu + conda | 需要改？ |
+|------|-------------|----------------|---------|
+| 安装方式 | `uv sync` | `pip install -e .` | ❌ 不需要 |
+| `pyproject.toml` | 使用 | 使用 | ❌ 不需要 |
+| `uv.lock` | 使用 | 忽略 | ❌ 可删除 |
+| 运行命令 | `uv run python script.py` | `python script.py` | ⚠️ 用法不同，代码不改 |
+| 强制 CPU | 需要（Windows JAX 无 CUDA） | 不需要（默认 GPU） | ✅ 已改为 `--cpu` 标志 |
+| `sys.path` hack | 需要 | 同样需要 | ❌ 不变 |
+| `rlt_online_rl` 包 | 不在安装列表 | 不在安装列表 | ❌ 不变（sys.path hack 兜底） |
+
+### Ubuntu + conda 环境准备 checklist
+
+```bash
+# 1. 激活 conda 环境
+conda activate your_env
+
+# 2. pip 安装 openpi（自动装 jax[cuda12]）
+pip install -e .
+
+# 3. 确认 JAX 能识别 GPU
+python -c "import jax; print(jax.devices())"
+# 期望输出: [cuda(id=0)] 或 [gpu(id=0)]
+
+# 4. 运行测试
+python examples/test_rlt_inference.py
+```
+
+> **一句话**：从 Windows + uv 切换到 Ubuntu + conda，核心代码无需任何修改。只需要注意运行命令从 `uv run python` 变为 `python`，且 JAX 在 Ubuntu 上会自动使用 GPU（无需再加 `jax.config.update("jax_platform_name", "cpu")`）。
