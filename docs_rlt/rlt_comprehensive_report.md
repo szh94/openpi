@@ -1191,9 +1191,25 @@ python examples/test_rlt_inference.py
 
 ---
 
-## 17. Ubuntu / Conda 迁移指南
+## 17. 项目运行环境
 
-从 Windows + uv 切换到 Ubuntu + conda，核心代码**无需任何修改**。
+本项目当前在 **Ubuntu + conda** 环境下运行。
+
+### 环境说明
+
+| 项目 | 配置 |
+|------|------|
+| 操作系统 | Ubuntu (Linux) |
+| Python 环境 | conda 虚拟环境 |
+| 安装方式 | `pip install -e .` |
+| JAX 版本 | `jax[cuda12]==0.5.3`（自动识别 GPU） |
+| 运行命令 | `python script.py` |
+
+核心代码**无需任何修改**即可在不同平台上运行（Windows / Ubuntu）。
+
+### 如果从 Windows 迁移
+
+以下是从 Windows + uv 切换到 Ubuntu + conda 的注意事项：
 
 ### 对比总结
 
