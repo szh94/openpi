@@ -776,3 +776,178 @@ python examples/test_rlt_inference.py
 ```
 
 > **一句话**：从 Windows + uv 切换到 Ubuntu + conda，核心代码无需任何修改。只需要注意运行命令从 `uv run python` 变为 `python`，且 JAX 在 Ubuntu 上会自动使用 GPU（无需再加 `jax.config.update("jax_platform_name", "cpu")`）。
+
+---
+
+## Q9: RLT Stage 1 训练的 Encoder 和 Decoder 参数量有多大？
+
+### 整体架构
+
+| 组件 | pi0.5 版本（当前实现） | pi0.6 版本（RLT 论文） |
+|------|:-------------------:|:--------------------:|
+| VLA 基座 | Gemma 2B + 300M Action Expert = **~2.3B** | Gemma 3 4B + 860M Action Expert = **~4.86B** |
+| **RLT 编码器（Encoder）** | **~196M**（width=2048） | **未公开**（width 与 Gemma 3 4B 的 hidden_size=2560 匹配，估计更大） |
+| **RLT 解码器（Decoder）** | **~250-280M**（width=2048） | **未公开**（同上，估计 ~300-400M） |
+| 冻结情况 | VLA 冻结 ✓ | VLA 冻结 ✓ |
+| Stage 1 后处理 | Encoder 冻结复用，Decoder 丢弃 | Encoder 冻结复用，Decoder 丢弃 |
+
+> **注意**：RLT 论文未公开 pi0.6 版本的 Encoder/Decoder 具体架构维度。pi0.6 的 Gemma 3 4B 的 hidden_size=2560，比 pi0.5 的 2048 大 25%，因此 Encoder/Decoder 参数量会成比例放大。上表的 pi0.6 估计值基于此比例推算。
+
+### 编码器细节（`RLTEncoder`）
+
+配置（`rl_token.py` 中的 `RLTEncoderConfig`）：
+
+| 参数 | 值 |
+|------|:---:|
+| `width` | 2048 |
+| `depth` | 4（层数） |
+| `num_heads` | 8 |
+| `mlp_ratio` | 4.0 |
+
+每层参数量：
+
+| 子层 | 参数量 |
+|------|:-----:|
+| Attention（QKV + 投影） | 4 × 2048² ≈ 16.8M |
+| MLP（Linear → GeLU → Linear, mlp_ratio=4.0） | 2 × 2048 × 8192 ≈ 33.6M |
+| LayerNorm | 2 × 2048 ≈ 4K（可忽略） |
+| **每层小计** | **~50M** |
+
+额外参数：
+
+| 参数 | 量级 |
+|------|:---:|
+| 可学习 `[RL]` token | 1 × 2048 = 2K |
+| 位置编码（max 4096） | 4096 × 2048 ≈ 8.4M |
+| 最终 LayerNorm | 2 × 2048 = 4K |
+
+**编码器总计：~196M 参数**
+
+### 解码器细节（`RLTDecoder`）
+
+配置与编码器相同（`width=2048, depth=4, num_heads=8, mlp_ratio=4.0`），但每层多一个 **cross-attention 子层**（Q、K、V + 投影 ≈ 额外 16.8M/层）。
+
+**解码器总计：~250-280M 参数**
+
+### 各版本对比
+
+| 版本 | 基座 VLA | Embedding Width | 编码器 | 解码器 | Stage 1 总训练 |
+|:----:|:--------:|:--------------:|:-----:|:-----:|:-------------:|
+| **当前实现（pi0.5）** | Gemma 2B + 300M（~2.3B） | 2048 | ~196M | ~250-280M | ~450-475M |
+| **RLT 论文（pi0.6）** | Gemma 3 4B + 860M（~4.86B） | 2560（估计） | 未公开（估计 ~300-350M） | 未公开（估计 ~350-450M） | 未公开（估计 ~650-800M） |
+
+### Stage 1 训练目标
+
+VLA 输出的 `N×2048` token 序列 → **Encoder 压缩为单个 2048 维 RL Token** → **Decoder 重建回 `N×2048`** → MSE 重建损失。
+
+```
+VLA token embeddings [B, N, 2048]
+        │
+        ▼
+  ┌─────────────┐
+  │  Encoder    │  4 层 Transformer，~196M
+  └──────┬──────┘
+         ▼
+  RL Token [B, 2048]   ← 瓶颈
+         │
+         ▼
+  ┌─────────────┐
+  │  Decoder    │  4 层 Cross-Attention Transformer，~250-280M
+  └──────┬──────┘
+         ▼
+  重建的 embeddings [B, N, 2048]
+        │
+  对比 MSE(重建, 原始)
+```
+
+超参数：lr=1e-4, batch_size=32, 30,000 步。训练完成后编码器冻结、解码器丢弃。
+
+---
+
+## Q10: RLT Stage 2 训练的 Actor 和 Critic 参数量有多大？
+
+### 架构概览
+
+Actor 和 Critic 都是轻量级 MLP，基于 TD3 框架。
+
+| 组件 | 输入维度 | 隐藏层维度 | 输出维度 | 隐藏层数 |
+|------|:--------:|:----------:|:--------:|:--------:|
+| **Actor MLP** | 2136 | **256** | 80 | 2 |
+| **Critic QNetwork** | 2136 | **256** | 1 | 2 |
+| Critic TwinQ（4 份总参数） | — | — | — | 2 |
+
+输入组合：
+
+```
+state_dim = 2048 (RL Token) + 8 (proprio) = 2056
+action_chunk_dim = 10 (chunk) × 8 (action_dim) = 80
+
+Actor 输入 = state_dim + action_chunk_dim = 2056 + 80 = 2136
+          (RL Token + proprio + VLA 参考动作)
+
+Critic 输入 = state_dim + action_chunk_dim = 2056 + 80 = 2136
+          (RL Token + proprio + 待评估的动作)
+```
+
+### 参数量明细
+
+**Actor（~638K）：**
+
+| 层 | 参数量 |
+|----|:-----:|
+| LayerNorm(2136) | 4,272 |
+| Linear(2136 → 256) | 547,072 |
+| Linear(256 → 256) | 65,792 |
+| Linear(256 → 80) | 20,560 |
+| **小计** | **~638K** |
+
+**Critic QNetwork × 2（~1.23M 可训练）：**
+
+| 层 | 单份参数量 |
+|----|:---------:|
+| LayerNorm(2136) | 4,272 |
+| Linear(2136 → 256) | 547,072 |
+| Linear(256 → 256) | 65,792 |
+| Linear(256 → 1) | 257 |
+| **单份小计** | **~617K** |
+| **两份 online（可训练）** | **~1.23M** |
+| **四份总计（含 target 网络）** | **~2.47M** |
+
+### Stage 2 总训练参数
+
+| 组件 | 参数量 | Stage 2 是否训练 |
+|------|:-----:|:----------------:|
+| VLA pi0.5 | ~2.3B | ❌ 冻结 |
+| RLT 编码器 | ~196M | ❌ 冻结（Stage 1 训完后冻结） |
+| **Actor** | **~638K** | ✅ **训练** |
+| **Critic（TwinQ）** | **~1.23M** | ✅ **训练** |
+| **Stage 2 总训练参数** | **~1.87M** | — |
+
+### 对比：各组件量级
+
+```
+VLA pi0.5 (2.3B)  ████████████████████████████████████████████████████████
+RLT 编码器 (196M)  ████▌
+Stage 2 训练参数   ▏
+  Actor (638K)     ▏
+  Critic (1.23M)   ▏
+```
+
+Stage 2 训练的 Actor + Critic 总共不到 **2M 参数**，与被冻结的 VLA（2.3B）和编码器（196M）相比几乎可以忽略不计。这也是 RLT 在线 RL 高效的原因——只需要更新极小的 MLP。
+
+### 关键设计
+
+- **Actor 最后一层零初始化**：输出初始为 0 → Actor 初始时完全复制 VLA 参考动作（residual 设计）
+- **Critic 无零初始化**：标准初始化
+- **TD3 特性**：TwinQ（取 min 防过估）、目标策略平滑噪声、延迟策略更新（critic 每 2 步更新一次 actor）
+- **参考丢弃（ref_dropout=0.5）**：50% 样本的参考动作被置零，防止 Actor 过度依赖 VLA
+
+### 各版本对比
+
+| 版本 | Actor 隐藏层 | Critic 隐藏层 | action_dim | 说明 |
+|:----:|:----------:|:-----------:|:---------:|:----|
+| **当前 PyTorch 实现** | 256 | 256 | 8 | 已合入主仓库，面向 Franka 机器人 |
+| **文档描述的 JAX 版** | 512 | 256 | 32 | 原始设计与 RLT 论文对齐的更通用配置 |
+| RLT 论文（pi0.6） | 未公开 | 未公开 | 32 | Gemma 3 4B 的 embedding width=2560，Actor/Critic 输入维度更高 |
+
+> **说明**：RLT 论文以 pi0.6 为基座，Gemma 3 4B 的 hidden_size=2560，因此 state_dim = 2560 + 32（proprio）= 2592，action_chunk_dim = 10 × 32 = 320，Actor 输入维度 = 2592 + 320 = **2912**，比 pi0.5 版本的 **2136** 大约 36%，MLP 参数量会成比例放大。此外论文版本可能使用不同的隐藏层宽度，具体数值未公开发布。
